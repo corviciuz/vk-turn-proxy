@@ -33,6 +33,8 @@ import (
 	"github.com/bogdanfinn/tls-client/profiles"
 
 	"github.com/bschaatsbergen/dnsdialer"
+	"github.com/cacggghp/vk-turn-proxy/client/warp"
+	warpapi "github.com/cacggghp/vk-turn-proxy/client/warp/api"
 	"github.com/cacggghp/vk-turn-proxy/tcputil"
 	"github.com/cbeuw/connutil"
 	"github.com/google/uuid"
@@ -1801,7 +1803,67 @@ func main() {
 	vlessMode := flag.Bool("vless", false, "VLESS mode: forward TCP connections (for VLESS) instead of UDP packets")
 	debugFlag := flag.Bool("debug", false, "enable debug logging")
 	manualCaptchaFlag := flag.Bool("manual-captcha", false, "skip auto captcha solving, use manual mode immediately")
+
+	// Warp mode flags
+	warpMode := flag.Bool("warp", false, "enable Cloudflare Warp endpoint")
+	warpProxy := flag.String("proxy", "127.0.0.1:4080", "mixed SOCKS5/HTTP proxy listen address")
+	warpConfig := flag.String("config", "config.json", "path to config file (auto-registers if not found at default path)")
+	warpLocalDNS := flag.Bool("local-dns", false, "use system DNS instead of routing through the tunnel")
+
 	flag.Parse()
+
+	isDebug = *debugFlag
+	manualCaptcha = *manualCaptchaFlag
+	autoCaptchaSliderPOC = !manualCaptcha
+
+	// Extract call link early so it's available for both modes
+	var link string
+	if *vklink != "" {
+		parts := strings.Split(*vklink, "join/")
+		link = parts[len(parts)-1]
+	} else if *yalink != "" {
+		parts := strings.Split(*yalink, "j/")
+		link = parts[len(parts)-1]
+	}
+	if idx := strings.IndexAny(link, "/?#"); idx != -1 {
+		link = link[:idx]
+	}
+
+	// ── Warp mode ────────────────────────────────────────────────────────────────
+	if *warpMode {
+		warpCfg := warp.DefaultRunnerConfig()
+		warpCfg.ProxyAddr = *warpProxy
+		warpCfg.ConfigPath = *warpConfig
+		warpCfg.LocalDNS = *warpLocalDNS
+		warpCfg.Debug = isDebug
+
+		// If a VK link is provided, set up a relay getter so that QUIC traffic
+		// for the MASQUE tunnel goes through the VK TURN relay.
+		if *vklink != "" {
+			// Build a dnsdialer with hardcoded DNS servers for reliable VK API resolution.
+			dialer := dnsdialer.New(
+				dnsdialer.WithResolvers("77.88.8.8:53", "77.88.8.1:53", "8.8.8.8:53", "8.8.4.4:53", "1.1.1.1:53", "1.0.0.1:53"),
+				dnsdialer.WithStrategy(dnsdialer.Fallback{}),
+				dnsdialer.WithCache(100, 10*time.Hour, 10*time.Hour),
+			)
+
+			warpCfg.GetRelayConn = func(relayCtx context.Context) (net.PacketConn, error) {
+				log.Printf("[Warp] Allocating VK TURN relay for MASQUE connection...")
+				user, pass, serverAddr, err := getVkCredsCached(relayCtx, link, 0, dialer)
+				if err != nil {
+					return nil, fmt.Errorf("get VK TURN creds: %w", err)
+				}
+				return allocateTurnRelayConn(relayCtx, user, pass, serverAddr, *host, *port, *udp)
+			}
+		}
+
+		if err := warp.Run(ctx, warpCfg); err != nil {
+			log.Fatalf("[Warp] Fatal error: %v", err)
+		}
+		return
+	}
+	// ── End Warp mode ─────────────────────────────────────────────────────────
+
 	if *peerAddr == "" {
 		log.Panicf("Need peer address!")
 	}
@@ -1813,16 +1875,9 @@ func main() {
 		log.Panicf("Need either vk-link or yandex-link!")
 	}
 
-	isDebug = *debugFlag
-	manualCaptcha = *manualCaptchaFlag
-	autoCaptchaSliderPOC = !manualCaptcha
-
-	var link string
 	var getCreds getCredsFunc
 	if *vklink != "" {
-		parts := strings.Split(*vklink, "join/")
-		link = parts[len(parts)-1]
-
+		// Use hardcoded DNS servers for reliable VK API resolution.
 		dialer := dnsdialer.New(
 			dnsdialer.WithResolvers("77.88.8.8:53", "77.88.8.1:53", "8.8.8.8:53", "8.8.4.4:53", "1.1.1.1:53", "1.0.0.1:53"),
 			dnsdialer.WithStrategy(dnsdialer.Fallback{}),
@@ -1836,8 +1891,6 @@ func main() {
 			*n = 10
 		}
 	} else {
-		parts := strings.Split(*yalink, "j/")
-		link = parts[len(parts)-1]
 		getCreds = func(ctx context.Context, s string, streamID int) (string, string, string, error) {
 			return getYandexCreds(s)
 		}
@@ -2313,3 +2366,82 @@ func pipe(ctx context.Context, c1, c2 net.Conn) {
 		log.Printf("pipe: failed to reset deadline c2: %v", err)
 	}
 }
+
+// allocateTurnRelayConn allocates a TURN relay connection suitable for use as
+// a baseConn for the Warp MASQUE QUIC session.
+// It authenticates with the VK TURN server and returns a net.PacketConn that
+// is already bound to the relay, pointed at the Cloudflare MASQUE endpoint.
+func allocateTurnRelayConn(ctx context.Context, user, pass, serverAddr, hostOverride, portOverride string, useUDP bool) (net.PacketConn, error) {
+	urlhost, urlport, err := net.SplitHostPort(serverAddr)
+	if err != nil {
+		return nil, fmt.Errorf("parse TURN server address: %w", err)
+	}
+	if hostOverride != "" {
+		urlhost = hostOverride
+	}
+	if portOverride != "" {
+		urlport = portOverride
+	}
+	turnServerAddr := net.JoinHostPort(urlhost, urlport)
+	turnServerUDPAddr, err := net.ResolveUDPAddr("udp", turnServerAddr)
+	if err != nil {
+		return nil, fmt.Errorf("resolve TURN server address: %w", err)
+	}
+
+	ctx1, cancel1 := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel1()
+
+	var turnConn net.PacketConn
+	if useUDP {
+		c, err := net.DialUDP("udp", nil, turnServerUDPAddr)
+		if err != nil {
+			return nil, fmt.Errorf("dial TURN (udp): %w", err)
+		}
+		turnConn = &connectedUDPConn{c}
+	} else {
+		var d net.Dialer
+		c, err := d.DialContext(ctx1, "tcp", turnServerAddr)
+		if err != nil {
+			return nil, fmt.Errorf("dial TURN (tcp): %w", err)
+		}
+		turnConn = turn.NewSTUNConn(c)
+	}
+
+	cfg := &turn.ClientConfig{
+		STUNServerAddr: turnServerAddr,
+		TURNServerAddr: turnServerAddr,
+		Conn:           turnConn,
+		Net:            newDirectNet(),
+		Username:       user,
+		Password:       pass,
+		// IPv4 allocation for Cloudflare endpoint
+		RequestedAddressFamily: turn.RequestedAddressFamilyIPv4,
+		LoggerFactory:          logging.NewDefaultLoggerFactory(),
+	}
+
+	client, err := turn.NewClient(cfg)
+	if err != nil {
+		_ = turnConn.Close()
+		return nil, fmt.Errorf("create TURN client: %w", err)
+	}
+	if err := client.Listen(); err != nil {
+		client.Close()
+		_ = turnConn.Close()
+		return nil, fmt.Errorf("TURN listen: %w", err)
+	}
+	relayConn, err := client.Allocate()
+	if err != nil {
+		client.Close()
+		_ = turnConn.Close()
+		return nil, fmt.Errorf("TURN allocate: %w", err)
+	}
+
+	log.Printf("[Warp] TURN relay allocated: %s", relayConn.LocalAddr())
+	// Return the relay connection; the caller (MaintainTunnel) will use it as
+	// the base PacketConn for the QUIC dial.
+	return relayConn, nil
+}
+
+// Ensure the warpapi package is referenced to avoid unused import error.
+// GetRelayConnFunc is used as the type of RunnerConfig.GetRelayConn.
+var _ = warpapi.GetRelayConnFunc(nil)
